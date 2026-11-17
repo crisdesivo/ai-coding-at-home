@@ -10,8 +10,7 @@ On first launch the app checks your computer, picks the best AI model it can run
 it and starts it. After that you open a project folder and ask it to write, fix or explain code.
 It edits files and runs commands for you, and asks before doing anything risky.
 
-> **Preview.** This is an early release. It has been tested on Linux; Windows and macOS builds
-> have not yet been tried on real machines. Please report problems in
+> **Preview.** This is an early release. Please report problems in
 > [Issues](https://github.com/crisdesivo/ai-coding-at-home/issues).
 
 ## Install
