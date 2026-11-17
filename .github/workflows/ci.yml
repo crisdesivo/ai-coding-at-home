@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci-required:
+    name: CI required
+    if: ${{ always() }}
+    needs:
+      - typecheck
+      - desktop-core
+      - desktop-package-linux
+      - desktop-package-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Require every CI job to succeed
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/check-ci-results.mjs
+
+  typecheck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Baseline checks (same command as local development)
+        run: pnpm check
+
+      - name: Verify dev launcher argv/PATH contract
+        run: pnpm --dir apps/desktop run verify:launcher-contract
+
+  desktop-core:
+    name: desktop-core
+    if: ${{ always() }}
+    needs: desktop-core-shards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Require every Core shard to succeed
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/check-ci-results.mjs --core-shards
+
+  desktop-core-shards:
+    name: Desktop Core (${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Vendor safeguard extensions
+        run: pnpm --dir apps/desktop run vendor:safeguards
+
+      - name: Install Linux display dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb openbox libnotify4
+          # The runner pipes crashes to systemd-coredump with an unlimited size, ignoring
+          # ulimit. A test that crashes a renderer then stalls quit while its multi-terabyte
+          # sparse address space is streamed out, so write plain core files, which the
+          # ulimit -c 0 of the test step blocks.
+          sudo sysctl -w kernel.core_pattern=core
+
+      - name: Desktop Core (Linux)
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: ${{ github.workspace }}/apps/desktop/test-results/core-report.json
+          PI_APP_TEST_WORKERS: "2"
+        # Openbox answers X11 maximize requests, which some window specs depend on.
+        # ulimit -c 0 keeps core files off whatever the runner's default is (see the step above).
+        run: >-
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24"
+          sh -c 'ulimit -c 0; openbox >/dev/null 2>&1 & exec "$@"' sh
+          pnpm --filter @pi-gui/desktop run test:e2e:core --shard=${{ matrix.shard }}/4 --reporter=line,json
+
+      - name: Summarize Core timing
+        if: ${{ !cancelled() }}
+        run: node .github/scripts/summarize-playwright-trend.mjs apps/desktop/test-results/core-report.json apps/desktop/test-results/core-summary.json
+
+      - name: Upload Core results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-core-test-results-${{ matrix.shard }}
+          path: apps/desktop/test-results/
+          retention-days: 7
+          if-no-files-found: error
+
+  desktop-package-linux:
+    # electron-builder's AppImage tools put an older libm on LD_LIBRARY_PATH, which breaks the
+    # system tools they call on Ubuntu 26.04 (glibc 2.43). Building on 24.04 also keeps the
+    # AppImage and deb usable on older distributions.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Vendor safeguard extensions
+        run: pnpm --dir apps/desktop run vendor:safeguards
+
+      - name: Package Linux AppImage and deb
+        run: pnpm --filter @pi-gui/desktop run package:linux
+
+      - name: Verify packaged runtime dependencies
+        run: pnpm --dir apps/desktop run verify:packaged-runtime-deps:linux
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-linux-packages-${{ github.sha }}
+          path: |
+            apps/desktop/release/*.AppImage
+            apps/desktop/release/*.deb
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  desktop-package-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify dev launcher argv/PATH contract
+        run: pnpm --dir apps/desktop run verify:launcher-contract
+
+      - name: Changed-file adapter tests
+        run: pnpm --filter @pi-gui/desktop run test:changed-files
+
+      - name: Vendor safeguard extensions
+        # Git's bash provides the patch tool the script applies to pix-gate.
+        shell: bash
+        run: pnpm --dir apps/desktop run vendor:safeguards
+
+      - name: Package Windows directory
+        run: pnpm --filter @pi-gui/desktop run package:win:dir
+
+      - name: Verify packaged runtime dependencies
+        run: pnpm --dir apps/desktop run verify:packaged-runtime-deps:windows

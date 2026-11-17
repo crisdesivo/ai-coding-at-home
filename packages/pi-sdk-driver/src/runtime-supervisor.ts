@@ -1,0 +1,962 @@
+import { readFile } from "node:fs/promises";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import {
+  DefaultPackageManager,
+  DefaultResourceLoader,
+  ModelRuntime,
+  type PackageSource,
+  SettingsManager,
+  parseFrontmatter,
+  stripFrontmatter,
+  type InlineExtension,
+  type PathMetadata,
+  type ResolvedPaths,
+  type ResolvedResource,
+} from "@earendil-works/pi-coding-agent";
+import type {
+  RuntimeExtensionDiagnostic,
+  RuntimeExtensionFlag,
+  RuntimeExtensionTool,
+  RuntimeExtensionRecord,
+  RuntimeModelRecord,
+  RuntimeProviderRecord,
+  RuntimeResourceDriver,
+  RuntimeSettingsSnapshot,
+  RuntimeSkillRecord,
+  RuntimeSourceInfo,
+  RuntimeSnapshot,
+} from "@pi-gui/session-driver/runtime-types";
+import type { SessionModelSelection, WorkspaceRef } from "@pi-gui/session-driver";
+import { createRuntimeDependencies } from "./runtime-deps.js";
+import {
+  createSettingsManagerWithoutNpmPackages,
+  isGlobalNpmLookupError,
+} from "./npm-package-fallback.js";
+import { skillSlashCommand } from "./runtime-command-utils.js";
+import {
+  findBuiltinExtension,
+  type BuiltinExtension,
+  type BuiltinExtensionEnabled,
+} from "./builtin-extensions.js";
+import {
+  isBuiltinExtensionPath,
+  PI_ADDON_EXTENSION_NAMES,
+  piAddonDisplay,
+  piAddonExtensions,
+} from "./pi-addon-extensions.js";
+
+/** A queued `pi.registerProvider()` call, as the extension runtime records it. */
+type ExtensionProviderRegistration = ReturnType<
+  DefaultResourceLoader["getExtensions"]
+>["runtime"]["pendingProviderRegistrations"][number];
+type ExtensionNativeProviderRegistration = ReturnType<
+  DefaultResourceLoader["getExtensions"]
+>["runtime"]["pendingNativeProviderRegistrations"][number];
+type ProviderAuthStatus = ReturnType<ModelRuntime["getProviderAuthStatus"]>;
+type StoredCredentialType = Awaited<ReturnType<ModelRuntime["listCredentials"]>>[number]["type"];
+
+interface RuntimeContext {
+  readonly workspace: WorkspaceRef;
+  readonly settingsManager: SettingsManager;
+  readonly packageManager: DefaultPackageManager;
+  readonly resourceLoader: DefaultResourceLoader;
+  /** `registerProvider()` calls this workspace's extensions made, in call order. */
+  extensionProviders: readonly ExtensionProviderRegistration[];
+  nativeProviders: readonly ExtensionNativeProviderRegistration[];
+  /** Runtime the snapshot is built from, owned by this workspace. */
+  modelRuntime: ModelRuntime;
+}
+
+export interface RuntimeSupervisorOptions {
+  readonly agentDir?: string;
+  readonly builtinExtensions?: readonly BuiltinExtension[];
+  readonly isBuiltinExtensionEnabled?: BuiltinExtensionEnabled;
+  /**
+   * When set, snapshots list this model's provider and nothing else: pi at home offers one
+   * local model, so built-in, extension and other `models.json` providers stay out of the app.
+   */
+  readonly localModel?: SessionModelSelection;
+}
+
+type ResourceScope = "user" | "project";
+type ToggleableResourceKind = "extension" | "skill";
+
+interface PackageMetadata {
+  readonly displayName?: string;
+  readonly description?: string;
+}
+
+export class RuntimeSupervisor implements RuntimeResourceDriver {
+  private readonly agentDir: string;
+  private readonly modelsJsonPath: string;
+  private readonly authPath: string;
+  private readonly builtinExtensions: readonly BuiltinExtension[];
+  private readonly isBuiltinExtensionEnabled: BuiltinExtensionEnabled;
+  private readonly localModel: SessionModelSelection | undefined;
+  private readonly contexts = new Map<string, RuntimeContext>();
+
+  constructor(options: RuntimeSupervisorOptions = {}) {
+    const deps = createRuntimeDependencies(options);
+    this.agentDir = deps.agentDir;
+    this.modelsJsonPath = deps.modelsJsonPath;
+    this.authPath = deps.authPath;
+    this.builtinExtensions = options.builtinExtensions ?? [];
+    this.isBuiltinExtensionEnabled = options.isBuiltinExtensionEnabled ?? (() => true);
+    this.localModel = options.localModel;
+  }
+
+  async getRuntimeSnapshot(workspace: WorkspaceRef): Promise<RuntimeSnapshot> {
+    const context = await this.ensureContext(workspace);
+    return this.buildSnapshot(context);
+  }
+
+  async refreshRuntime(workspace: WorkspaceRef): Promise<RuntimeSnapshot> {
+    const context = await this.ensureContext(workspace);
+    await context.settingsManager.reload();
+    await this.reloadResources(context);
+    return this.buildSnapshot(context);
+  }
+
+  async setEnableSkillCommands(
+    workspace: WorkspaceRef,
+    enabled: boolean,
+  ): Promise<RuntimeSnapshot> {
+    const context = await this.ensureContext(workspace);
+    context.settingsManager.setEnableSkillCommands(enabled);
+    await context.settingsManager.flush();
+    await this.reloadResources(context);
+    return this.buildSnapshot(context);
+  }
+
+  async setSkillEnabled(
+    workspace: WorkspaceRef,
+    filePath: string,
+    enabled: boolean,
+  ): Promise<RuntimeSnapshot> {
+    const context = await this.ensureContext(workspace);
+    const resolvedPaths = await this.resolveRuntimePaths(context);
+    const resource = resolvedPaths.skills.find(
+      (entry) => resolve(entry.path) === resolve(filePath),
+    );
+    if (!resource) {
+      throw new Error(`Unknown skill: ${filePath}`);
+    }
+
+    this.toggleResource(context, resource, enabled, "skill");
+    await context.settingsManager.flush();
+    await this.reloadResources(context);
+    return this.buildSnapshot(context);
+  }
+
+  async setExtensionEnabled(
+    workspace: WorkspaceRef,
+    filePath: string,
+    enabled: boolean,
+  ): Promise<RuntimeSnapshot> {
+    const context = await this.ensureContext(workspace);
+    const resolvedPaths = await this.resolveRuntimePaths(context);
+    const resource = resolvedPaths.extensions.find(
+      (entry) => extensionPathKey(entry.path) === extensionPathKey(filePath),
+    );
+    if (!resource) {
+      throw new Error(`Unknown extension: ${filePath}`);
+    }
+
+    this.toggleResource(context, resource, enabled, "extension");
+    await context.settingsManager.flush();
+    await this.reloadResources(context);
+    return this.buildSnapshot(context);
+  }
+
+  /** The built-in's name when `path` is a pi-gui built-in extension, which Settings toggles app-wide. */
+  builtinExtensionName(path: string): string | undefined {
+    return findBuiltinExtension(this.builtinExtensions, path)?.name;
+  }
+
+  /**
+   * Every pi-gui built-in loads ungated here so Settings can list a switched-off one with its
+   * tools. pi's add-ons keep their `builtin` flag so pi's `extensions` setting still gates them.
+   */
+  private inventoryExtensionFactories(): InlineExtension[] {
+    return [
+      ...piAddonExtensions(),
+      ...this.builtinExtensions.map(({ name, factory }) => ({ name, factory })),
+    ];
+  }
+
+  /** Resolves pi's add-ons as `builtin:<name>` resources, like `pi config` does. */
+  private createPackageManager(
+    cwd: string,
+    settingsManager: SettingsManager,
+  ): DefaultPackageManager {
+    return new DefaultPackageManager({
+      cwd,
+      agentDir: this.agentDir,
+      settingsManager,
+      builtinExtensions: [...PI_ADDON_EXTENSION_NAMES],
+    });
+  }
+
+  private async ensureContext(workspace: WorkspaceRef): Promise<RuntimeContext> {
+    const existing = this.contexts.get(workspace.workspaceId);
+    if (existing) {
+      return existing;
+    }
+
+    let settingsManager = SettingsManager.create(workspace.path, this.agentDir);
+    let packageManager = this.createPackageManager(workspace.path, settingsManager);
+    let resourceLoader = new DefaultResourceLoader({
+      cwd: workspace.path,
+      agentDir: this.agentDir,
+      settingsManager,
+      extensionFactories: this.inventoryExtensionFactories(),
+    });
+    try {
+      await resourceLoader.reload();
+    } catch (error) {
+      if (!isGlobalNpmLookupError(error)) {
+        throw error;
+      }
+
+      const fallbackSettingsManager = createSettingsManagerWithoutNpmPackages(settingsManager);
+      if (!fallbackSettingsManager) {
+        throw error;
+      }
+
+      console.warn(
+        `[pi-gui] Falling back to runtime resource loading without npm package sources for ${workspace.path}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+
+      settingsManager = fallbackSettingsManager;
+      packageManager = this.createPackageManager(workspace.path, settingsManager);
+      resourceLoader = new DefaultResourceLoader({
+        cwd: workspace.path,
+        agentDir: this.agentDir,
+        settingsManager,
+        extensionFactories: this.inventoryExtensionFactories(),
+      });
+      await resourceLoader.reload();
+    }
+
+    const applied = await this.applyExtensionProviders(resourceLoader);
+    const context: RuntimeContext = {
+      workspace,
+      settingsManager,
+      packageManager,
+      resourceLoader,
+      extensionProviders: applied.accepted,
+      nativeProviders: applied.acceptedNative,
+      modelRuntime: applied.runtime,
+    };
+    this.contexts.set(workspace.workspaceId, context);
+    return context;
+  }
+
+  /**
+   * Drop a workspace's cached context.
+   *
+   * Contexts hold that workspace's resource loader, settings manager, and model
+   * runtime, so a removed workspace has to give them up — otherwise its
+   * extensions keep their providers alive for the rest of the process.
+   */
+  removeWorkspace(workspaceId: WorkspaceRef["workspaceId"]): void {
+    this.contexts.delete(workspaceId);
+  }
+
+  private async reloadResources(context: RuntimeContext): Promise<void> {
+    await context.resourceLoader.reload();
+    const applied = await this.applyExtensionProviders(context.resourceLoader);
+    context.extensionProviders = applied.accepted;
+    context.nativeProviders = applied.acceptedNative;
+    context.modelRuntime = applied.runtime;
+  }
+
+  /**
+   * Drain the providers this workspace's extensions registered while loading.
+   *
+   * `pi` queues `pi.registerProvider()` calls made during extension load on the
+   * resource loader's extension runtime and flushes them when session services are
+   * created (`createAgentSessionServices`). The runtime snapshot never goes through
+   * that path, so without this the model list only ever shows built-ins,
+   * `models.json` providers, and custom providers — extension-provided models are
+   * invisible in settings and pickers even though sessions can use them.
+   *
+   * Each reload replays every enabled extension, so the drained queue is the
+   * workspace's complete current set: providers whose extension was disabled or
+   * removed simply do not come back.
+   *
+   * The queue is kept in call order rather than collapsed per provider id.
+   * `registerProvider()` is a merge, not an assignment — a full registration
+   * followed by a `baseUrl`-only one keeps the models and re-points them — so
+   * only replaying every call reproduces what `pi` itself would build.
+   */
+  private drainExtensionProviders(resourceLoader: DefaultResourceLoader): {
+    readonly registrations: ExtensionProviderRegistration[];
+    readonly nativeRegistrations: ExtensionNativeProviderRegistration[];
+  } {
+    const { runtime } = resourceLoader.getExtensions();
+    const registrations = [...runtime.pendingProviderRegistrations];
+    const nativeRegistrations = [...runtime.pendingNativeProviderRegistrations];
+    runtime.pendingProviderRegistrations = [];
+    runtime.pendingNativeProviderRegistrations = [];
+    return { registrations, nativeRegistrations };
+  }
+
+  private async applyExtensionProviders(resourceLoader: DefaultResourceLoader): Promise<{
+    readonly runtime: ModelRuntime;
+    readonly accepted: ExtensionProviderRegistration[];
+    readonly acceptedNative: ExtensionNativeProviderRegistration[];
+  }> {
+    const drained = this.drainExtensionProviders(resourceLoader);
+    return this.buildWorkspaceModelRuntime(drained.registrations, drained.nativeRegistrations);
+  }
+
+  /**
+   * Build a cwd-scoped runtime from disk plus this workspace's extension providers.
+   *
+   * A fresh instance rather than mutating a shared runtime: passing one runtime
+   * into every session is what lets two workspaces steal each other's dispatch
+   * for the same provider id. Constructing a runtime has no global effect.
+   */
+  private async buildWorkspaceModelRuntime(
+    registrations: readonly ExtensionProviderRegistration[],
+    nativeRegistrations: readonly ExtensionNativeProviderRegistration[],
+  ): Promise<{
+    readonly runtime: ModelRuntime;
+    readonly accepted: ExtensionProviderRegistration[];
+    readonly acceptedNative: ExtensionNativeProviderRegistration[];
+  }> {
+    const runtime = await ModelRuntime.create({
+      authPath: this.authPath,
+      modelsPath: this.modelsJsonPath,
+      refreshOnCreate: false,
+    });
+    const accepted: ExtensionProviderRegistration[] = [];
+    for (const registration of registrations) {
+      const { name, config, extensionPath } = registration;
+      try {
+        // Copy: registering merges into the stored config object in place, which
+        // would let a later registration rewrite our captured config.
+        runtime.registerProvider(name, { ...config });
+        accepted.push(registration);
+      } catch (error) {
+        console.warn(
+          `[pi-gui] Extension "${extensionPath}" failed to register provider "${name}": ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    const acceptedNative: ExtensionNativeProviderRegistration[] = [];
+    for (const registration of nativeRegistrations) {
+      const { provider, extensionPath } = registration;
+      try {
+        runtime.registerNativeProvider(provider);
+        acceptedNative.push(registration);
+      } catch (error) {
+        console.warn(
+          `[pi-gui] Extension "${extensionPath}" failed to register native provider "${provider.id}": ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    await runtime.refresh({ allowNetwork: false });
+    return { runtime, accepted, acceptedNative };
+  }
+
+  private async buildSnapshot(context: RuntimeContext): Promise<RuntimeSnapshot> {
+    await context.modelRuntime.refresh({ allowNetwork: false });
+    const resolvedPaths = await this.resolveRuntimePaths(context);
+    const [skills, extensions, providers, models] = await Promise.all([
+      this.buildSkillRecords(context, resolvedPaths.skills),
+      this.buildExtensionRecords(context, resolvedPaths.extensions),
+      this.buildProviderRecords(context),
+      this.buildModelRecords(context),
+    ]);
+
+    const defaultProvider = context.settingsManager.getDefaultProvider();
+    const defaultModelId = context.settingsManager.getDefaultModel();
+    const defaultThinkingLevel = context.settingsManager.getDefaultThinkingLevel();
+    const settings: RuntimeSettingsSnapshot = {
+      ...(defaultProvider ? { defaultProvider } : {}),
+      ...(defaultModelId ? { defaultModelId } : {}),
+      ...(defaultThinkingLevel ? { defaultThinkingLevel } : {}),
+      enableSkillCommands: context.settingsManager.getEnableSkillCommands(),
+      enabledModelPatterns: context.settingsManager.getEnabledModels() ?? [],
+    };
+
+    return {
+      workspace: context.workspace,
+      providers,
+      models,
+      skills,
+      extensions,
+      settings,
+    };
+  }
+
+  private async resolveRuntimePaths(context: RuntimeContext): Promise<ResolvedPaths> {
+    try {
+      return await context.packageManager.resolve();
+    } catch (error) {
+      if (!isGlobalNpmLookupError(error)) {
+        throw error;
+      }
+
+      const fallbackSettingsManager = createSettingsManagerWithoutNpmPackages(
+        context.settingsManager,
+      );
+      if (!fallbackSettingsManager) {
+        throw error;
+      }
+
+      console.warn(
+        `[pi-gui] Falling back to runtime package resolution without npm package sources for ${context.workspace.path}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+
+      const fallbackPackageManager = this.createPackageManager(
+        context.workspace.path,
+        fallbackSettingsManager,
+      );
+      return fallbackPackageManager.resolve();
+    }
+  }
+
+  /** Whether the app shows this provider: only the local one when a local model is set. */
+  private isListedProvider(providerId: string): boolean {
+    return !this.localModel || providerId === this.localModel.provider;
+  }
+
+  private async buildProviderRecords(
+    context: RuntimeContext,
+  ): Promise<readonly RuntimeProviderRecord[]> {
+    const runtime = context.modelRuntime;
+    const credentials = await runtime.listCredentials();
+    const credentialByProvider = new Map(
+      credentials.map((credential) => [credential.providerId, credential.type] as const),
+    );
+    const oauthProviders = new Map(
+      runtime
+        .getProviders()
+        .filter((provider) => Boolean(provider.auth.oauth))
+        .map((provider) => [provider.id, provider] as const),
+    );
+    const providerIds = new Set<string>([
+      ...runtime.getModels().map((model) => model.provider),
+      ...oauthProviders.keys(),
+      ...credentialByProvider.keys(),
+    ]);
+
+    return [...providerIds]
+      .filter((providerId) => this.isListedProvider(providerId))
+      .sort((left, right) => left.localeCompare(right))
+      .map((providerId) => {
+        const storedType = credentialByProvider.get(providerId);
+        const oauthProvider = oauthProviders.get(providerId);
+        const providerAuthStatus = runtime.getProviderAuthStatus(providerId);
+        const hasAuth = providerAuthStatus.configured || storedType !== undefined;
+        return {
+          id: providerId,
+          name: oauthProvider?.name ?? runtime.getProvider(providerId)?.name ?? providerId,
+          hasAuth,
+          authType: storedType ?? "none",
+          authSource: inferProviderAuthSource(storedType, providerAuthStatus),
+          oauthSupported: false,
+          apiKeySetupSupported: false,
+        };
+      });
+  }
+
+  private async buildModelRecords(context: RuntimeContext): Promise<readonly RuntimeModelRecord[]> {
+    const runtime = context.modelRuntime;
+    const availableKeys = new Set(
+      (await runtime.getAvailable()).map((model) => `${model.provider}:${model.id}`),
+    );
+    const providers = new Map(
+      (await this.buildProviderRecords(context)).map((provider) => [provider.id, provider]),
+    );
+
+    return runtime
+      .getModels()
+      .filter(
+        (model) =>
+          this.isListedProvider(model.provider) &&
+          (!this.localModel || model.id === this.localModel.modelId),
+      )
+      .map<RuntimeModelRecord>((model) => {
+        const provider = providers.get(model.provider);
+        return {
+          providerId: model.provider,
+          providerName: provider?.name ?? model.provider,
+          modelId: model.id,
+          label: model.name,
+          available: availableKeys.has(`${model.provider}:${model.id}`),
+          authType: provider?.authType ?? "none",
+          reasoning: Boolean(model.reasoning),
+          supportsImages: model.input.includes("image"),
+          scope: "all",
+        };
+      })
+      .sort((left, right) =>
+        left.providerId === right.providerId
+          ? left.modelId.localeCompare(right.modelId)
+          : left.providerId.localeCompare(right.providerId),
+      );
+  }
+
+  private async buildSkillRecords(
+    context: RuntimeContext,
+    resolvedSkills: readonly ResolvedResource[],
+  ): Promise<readonly RuntimeSkillRecord[]> {
+    const loadedSkills = new Map(
+      context.resourceLoader
+        .getSkills()
+        .skills.map((skill) => [resolve(skill.filePath), skill] as const),
+    );
+
+    const records = await Promise.all(
+      resolvedSkills.map(async (resource) => {
+        const filePath = resolve(resource.path);
+        const loaded = loadedSkills.get(filePath);
+        const fallback = loaded ? undefined : await readSkillMetadata(filePath);
+        const name = loaded?.name ?? fallback?.name ?? inferSkillName(filePath);
+        const description =
+          loaded?.description ?? fallback?.description ?? "No description provided.";
+        const disableModelInvocation =
+          loaded?.disableModelInvocation ?? fallback?.disableModelInvocation ?? false;
+
+        return {
+          name,
+          description,
+          filePath,
+          baseDir: loaded?.baseDir ?? dirname(filePath),
+          source: resource.metadata.source,
+          scope: resource.metadata.scope,
+          enabled: resource.enabled,
+          disableModelInvocation,
+          slashCommand: skillSlashCommand(name),
+        } satisfies RuntimeSkillRecord;
+      }),
+    );
+
+    return records.sort((left: RuntimeSkillRecord, right: RuntimeSkillRecord) =>
+      left.name.localeCompare(right.name),
+    );
+  }
+
+  private async buildExtensionRecords(
+    context: RuntimeContext,
+    resolvedExtensions: readonly ResolvedResource[],
+  ): Promise<readonly RuntimeExtensionRecord[]> {
+    const loadedResult = context.resourceLoader.getExtensions();
+    const packageMetadataCache = new Map<string, Promise<PackageMetadata>>();
+    const loadedByPath = new Map(
+      loadedResult.extensions.map(
+        (extension) =>
+          [extensionPathKey(extension.resolvedPath || extension.path), extension] as const,
+      ),
+    );
+    const diagnosticsByPath = new Map<string, RuntimeExtensionDiagnostic[]>();
+
+    for (const error of loadedResult.errors) {
+      const diagnostics = diagnosticsByPath.get(extensionPathKey(error.path)) ?? [];
+      diagnostics.push({
+        type: "error",
+        message: error.error,
+        path: error.path,
+      });
+      diagnosticsByPath.set(extensionPathKey(error.path), diagnostics);
+    }
+
+    const records = await Promise.all(
+      resolvedExtensions.map<Promise<RuntimeExtensionRecord>>(async (resource) => {
+        const path = extensionPathKey(resource.path);
+        const loaded = loadedByPath.get(path);
+        const packageMetadata =
+          piAddonDisplay(path) ??
+          (await inferExtensionPackageMetadata(resource.metadata, packageMetadataCache));
+        return {
+          path,
+          displayName: packageMetadata?.displayName ?? inferExtensionEntryName(path),
+          ...(packageMetadata?.description ? { description: packageMetadata.description } : {}),
+          enabled: resource.enabled,
+          sourceInfo: toRuntimeSourceInfo(path, resource.metadata),
+          commands: loaded
+            ? [...loaded.commands.keys()].sort((left, right) => left.localeCompare(right))
+            : [],
+          tools: loaded ? describeTools(loaded.tools) : [],
+          flags: loaded
+            ? [...loaded.flags.keys()].sort((left, right) => left.localeCompare(right))
+            : [],
+          flagDetails: loaded ? describeFlags(loaded.flags) : [],
+          shortcuts: loaded
+            ? [...loaded.shortcuts.keys()].sort((left, right) => left.localeCompare(right))
+            : [],
+          diagnostics: diagnosticsByPath.get(path) ?? [],
+        };
+      }),
+    );
+    const resolvedRecordPaths = new Set(records.map((record) => extensionPathKey(record.path)));
+    const inlineRecords = loadedResult.extensions
+      .filter(
+        (extension) =>
+          extension.path.startsWith("<inline:") &&
+          !resolvedRecordPaths.has(extensionPathKey(extension.path)),
+      )
+      .map((extension) => this.buildInlineExtensionRecord(extension));
+    records.push(...inlineRecords);
+
+    return records.sort((left, right) =>
+      left.displayName === right.displayName
+        ? left.path.localeCompare(right.path)
+        : left.displayName.localeCompare(right.displayName),
+    );
+  }
+
+  private buildInlineExtensionRecord(
+    extension: ReturnType<DefaultResourceLoader["getExtensions"]>["extensions"][number],
+  ): RuntimeExtensionRecord {
+    const builtin = findBuiltinExtension(this.builtinExtensions, extension.path);
+    return {
+      path: extension.path,
+      displayName: builtin?.displayName ?? extension.path,
+      ...(builtin?.description ? { description: builtin.description } : {}),
+      enabled: builtin ? this.isBuiltinExtensionEnabled(builtin.name) : true,
+      sourceInfo: {
+        path: extension.path,
+        source: "builtin",
+        scope: "temporary",
+        origin: "top-level",
+      },
+      commands: [...extension.commands.keys()].sort((left, right) => left.localeCompare(right)),
+      tools: describeTools(extension.tools),
+      flags: [...extension.flags.keys()].sort((left, right) => left.localeCompare(right)),
+      flagDetails: describeFlags(extension.flags),
+      shortcuts: [...extension.shortcuts.keys()].sort((left, right) => left.localeCompare(right)),
+      diagnostics: [],
+    };
+  }
+
+  private toggleResource(
+    context: RuntimeContext,
+    resource: ResolvedResource,
+    enabled: boolean,
+    kind: ToggleableResourceKind,
+  ): void {
+    const { settingsManager } = context;
+    const scope = resource.metadata.scope;
+    if (scope !== "project" && scope !== "user") {
+      throw new Error(`Cannot update ${kind} at scope ${scope}`);
+    }
+    const origin = resource.metadata.origin;
+    const settings =
+      scope === "project"
+        ? settingsManager.getProjectSettings()
+        : settingsManager.getGlobalSettings();
+    const pattern = this.relativeResourcePattern(resource.path, resource.metadata, scope, origin);
+
+    if (origin === "top-level") {
+      const currentPaths =
+        kind === "skill" ? [...(settings.skills ?? [])] : [...(settings.extensions ?? [])];
+      const updated = replaceResourcePattern(currentPaths, pattern, enabled);
+      this.setTopLevelResourcePaths(settingsManager, scope, kind, updated);
+      return;
+    }
+
+    const packages = [...(settings.packages ?? [])];
+    const source = resource.metadata.source;
+    const packageIndex = packages.findIndex(
+      (entry) => (typeof entry === "string" ? entry : entry.source) === source,
+    );
+    if (packageIndex < 0) {
+      throw new Error(
+        `${titleForResourceKind(kind)} package source not found for ${resource.path}`,
+      );
+    }
+
+    const currentPackage = packages[packageIndex];
+    const nextPackage =
+      typeof currentPackage === "string" ? { source: currentPackage } : { ...currentPackage };
+    const currentPatterns =
+      kind === "skill" ? [...(nextPackage.skills ?? [])] : [...(nextPackage.extensions ?? [])];
+    const updatedPatterns = replaceResourcePattern(currentPatterns, pattern, enabled);
+    if (updatedPatterns.length > 0) {
+      if (kind === "skill") {
+        nextPackage.skills = updatedPatterns;
+      } else {
+        nextPackage.extensions = updatedPatterns;
+      }
+    } else {
+      if (kind === "skill") {
+        delete nextPackage.skills;
+      } else {
+        delete nextPackage.extensions;
+      }
+    }
+
+    const hasFilters = ["skills", "extensions", "prompts", "themes"].some((key) =>
+      Object.prototype.hasOwnProperty.call(nextPackage, key),
+    );
+    packages[packageIndex] = (hasFilters ? nextPackage : nextPackage.source) as PackageSource;
+
+    if (scope === "project") {
+      settingsManager.setProjectPackages(packages);
+    } else {
+      settingsManager.setPackages(packages);
+    }
+  }
+
+  private setTopLevelResourcePaths(
+    settingsManager: SettingsManager,
+    scope: ResourceScope,
+    kind: ToggleableResourceKind,
+    paths: string[],
+  ): void {
+    if (kind === "skill") {
+      if (scope === "project") {
+        settingsManager.setProjectSkillPaths(paths);
+      } else {
+        settingsManager.setSkillPaths(paths);
+      }
+      return;
+    }
+
+    if (scope === "project") {
+      settingsManager.setProjectExtensionPaths(paths);
+    } else {
+      settingsManager.setExtensionPaths(paths);
+    }
+  }
+
+  private relativeResourcePattern(
+    filePath: string,
+    metadata: PathMetadata,
+    scope: ResourceScope,
+    origin: PathMetadata["origin"],
+  ): string {
+    // pi's add-ons are named by their `builtin:<name>` path, as pi's own `pi config` writes them.
+    if (metadata.source === "builtin") {
+      return filePath;
+    }
+    if (origin === "package") {
+      const baseDir = metadata.baseDir ?? dirname(filePath);
+      return relative(baseDir, filePath);
+    }
+
+    const baseDir = metadata.baseDir ?? (scope === "project" ? dirname(filePath) : this.agentDir);
+    return relative(baseDir, filePath);
+  }
+}
+
+async function readJsonRecord(filePath: string): Promise<Record<string, unknown>> {
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** `builtin:<name>` names one of pi's add-ons, not a file, so it is compared as is. */
+function extensionPathKey(path: string): string {
+  return isBuiltinExtensionPath(path) ? path : resolve(path);
+}
+
+function replaceResourcePattern(
+  patterns: readonly string[],
+  resourcePattern: string,
+  enabled: boolean,
+): string[] {
+  const next = patterns.filter((pattern) => stripPrefix(pattern) !== resourcePattern);
+  next.push(`${enabled ? "+" : "-"}${resourcePattern}`);
+  return next;
+}
+
+function stripPrefix(pattern: string): string {
+  return pattern.startsWith("+") || pattern.startsWith("-") || pattern.startsWith("!")
+    ? pattern.slice(1)
+    : pattern;
+}
+
+async function readSkillMetadata(
+  filePath: string,
+): Promise<{ name?: string; description?: string; disableModelInvocation?: boolean } | undefined> {
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const frontmatter = parseFrontmatter(raw) as
+      | {
+          name?: string;
+          description?: string;
+          "disable-model-invocation"?: boolean;
+        }
+      | undefined;
+    const body = stripFrontmatter(raw);
+    const metadata: { name?: string; description?: string; disableModelInvocation?: boolean } = {};
+    if (frontmatter?.name) {
+      metadata.name = frontmatter.name;
+    }
+    const description = frontmatter?.description ?? firstNonEmptyLine(body);
+    if (description) {
+      metadata.description = description;
+    }
+    if (frontmatter?.["disable-model-invocation"] !== undefined) {
+      metadata.disableModelInvocation = frontmatter["disable-model-invocation"];
+    }
+    return metadata;
+  } catch {
+    return undefined;
+  }
+}
+
+function inferSkillName(filePath: string): string {
+  const parent = basename(dirname(filePath));
+  if (basename(filePath).toLowerCase() === "skill.md" && parent) {
+    return parent;
+  }
+  return basename(filePath).replace(/\.md$/i, "");
+}
+
+async function inferExtensionPackageMetadata(
+  metadata: PathMetadata,
+  packageMetadataCache: Map<string, Promise<PackageMetadata>>,
+): Promise<PackageMetadata | undefined> {
+  if (metadata.origin === "package" && metadata.baseDir) {
+    return inferPackageMetadata(metadata.baseDir, packageMetadataCache);
+  }
+  return undefined;
+}
+
+function inferExtensionEntryName(filePath: string): string {
+  return basename(filePath).replace(/\.(c|m)?(t|j)sx?$/i, "");
+}
+
+async function inferPackageMetadata(
+  packageRoot: string,
+  packageMetadataCache: Map<string, Promise<PackageMetadata>>,
+): Promise<PackageMetadata> {
+  const normalizedRoot = resolve(packageRoot);
+  const cached = packageMetadataCache.get(normalizedRoot);
+  if (cached) {
+    return cached;
+  }
+
+  const pending = readPackageMetadata(normalizedRoot);
+  packageMetadataCache.set(normalizedRoot, pending);
+  return pending;
+}
+
+async function readPackageMetadata(packageRoot: string): Promise<PackageMetadata> {
+  const folderName = basename(packageRoot).trim();
+  const packageJson = (await readJsonRecord(join(packageRoot, "package.json"))) as {
+    readonly displayName?: unknown;
+    readonly description?: unknown;
+  };
+  const displayName =
+    typeof packageJson.displayName === "string" && packageJson.displayName.trim()
+      ? packageJson.displayName.trim()
+      : folderName;
+  const description =
+    typeof packageJson.description === "string" && packageJson.description.trim()
+      ? packageJson.description.trim()
+      : undefined;
+
+  return {
+    ...(displayName ? { displayName } : {}),
+    ...(description ? { description } : {}),
+  };
+}
+
+function inferProviderAuthSource(
+  storedType: StoredCredentialType | undefined,
+  providerAuthStatus: ProviderAuthStatus,
+): "none" | "oauth" | "auth_file" | "env" | "external" {
+  if (storedType === "oauth") {
+    return "oauth";
+  }
+  if (storedType === "api_key") {
+    return "auth_file";
+  }
+  switch (providerAuthStatus.source) {
+    case "stored":
+      return "auth_file";
+    case "environment":
+      return "env";
+    case "fallback":
+    case "models_json_command":
+    case "models_json_key":
+    case "runtime":
+      return "external";
+  }
+  if (!providerAuthStatus.configured) {
+    return "none";
+  }
+  return "external";
+}
+
+function toRuntimeSourceInfo(path: string, metadata: PathMetadata): RuntimeSourceInfo {
+  return {
+    path,
+    source: metadata.source,
+    scope: metadata.scope,
+    origin: metadata.origin,
+    ...(metadata.baseDir ? { baseDir: metadata.baseDir } : {}),
+  };
+}
+
+function titleForResourceKind(kind: ToggleableResourceKind): string {
+  return kind === "skill" ? "Skill" : "Extension";
+}
+
+function firstNonEmptyLine(value: string): string | undefined {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+}
+
+/** pi's own tools (its `allToolNames`, which pi does not export). An extension may replace one. */
+const PI_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "read",
+  "bash",
+  "powershell",
+  "edit",
+  "write",
+  "grep",
+  "find",
+  "ls",
+]);
+
+function describeTools(
+  tools: ReadonlyMap<string, { definition: { name: string; label?: unknown } }>,
+): RuntimeExtensionTool[] {
+  return [...tools.values()]
+    .map(({ definition }) => ({
+      name: definition.name,
+      // pi does not check the label, so an untyped extension can leave it out.
+      label: typeof definition.label === "string" ? definition.label : "",
+      replacesPiTool: PI_TOOL_NAMES.has(definition.name),
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function describeFlags(
+  flags: ReadonlyMap<
+    string,
+    { description?: string; type: "boolean" | "string"; default?: boolean | string }
+  >,
+): RuntimeExtensionFlag[] {
+  return [...flags.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, flag]) => ({
+      name,
+      ...(flag.description ? { description: flag.description } : {}),
+      type: flag.type,
+      ...(flag.default !== undefined ? { default: flag.default } : {}),
+    }));
+}

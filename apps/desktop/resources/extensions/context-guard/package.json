@@ -1,0 +1,13 @@
+{
+  "name": "pi-at-home-context-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "pi at home: keeps tool output small enough for a local model's context window.",
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  }
+}

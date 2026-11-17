@@ -1,0 +1,47 @@
+{
+  "tag": "b12445",
+  "assets": {
+    "linux-vulkan-x64": {
+      "name": "llama-b12445-bin-ubuntu-vulkan-x64.tar.gz",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12445/llama-b12445-bin-ubuntu-vulkan-x64.tar.gz",
+      "sha256": "7a9a41ba003a0a318c09d0eaf56d9bdf7055e8474c72a0c34dee5557ea232312",
+      "size": 36404128
+    },
+    "win-vulkan-x64": {
+      "name": "llama-b12445-bin-win-vulkan-x64.zip",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12445/llama-b12445-bin-win-vulkan-x64.zip",
+      "sha256": "d6c15162dbeb03470a65ab095f9a8ee1b8dfe5125352f9bc64296a5ac5dabe11",
+      "size": 38300254
+    },
+    "mac-arm64": {
+      "name": "llama-b12445-bin-macos-arm64.tar.gz",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12445/llama-b12445-bin-macos-arm64.tar.gz",
+      "sha256": "44a097f66c5ceadb3eb1b3eccd54c331cf1fa3d93cbb246eda583b1fe0980540",
+      "size": 17011789
+    },
+    "linux-cuda-x64": {
+      "name": "llama-b12445-bin-ubuntu-cuda-12.8-x64.tar.gz",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12445/llama-b12445-bin-ubuntu-cuda-12.8-x64.tar.gz",
+      "sha256": "d096b36bca02941f65423989638bf1049c6a5abf9eebb05d8ac3350643a647f0",
+      "size": 200104703
+    },
+    "linux-cudart-x64": {
+      "name": "cudart-llama-b12445-bin-ubuntu-cuda-12.8-x64.tar.gz",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12445/cudart-llama-b12445-bin-ubuntu-cuda-12.8-x64.tar.gz",
+      "sha256": "5e970da7e160df0e5e794b6bb37a51be7863200f6da2d8c607739006bcc5688b",
+      "size": 594376097
+    },
+    "win-cuda-x64": {
+      "name": "llama-b12445-bin-win-cuda-12.4-x64.zip",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12445/llama-b12445-bin-win-cuda-12.4-x64.zip",
+      "sha256": "f9fed2ff62227c70130a227e035fdd58a727aba44b5e4811e527d08ab04149c0",
+      "size": 320119361
+    },
+    "win-cudart-x64": {
+      "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12445/cudart-llama-bin-win-cuda-12.4-x64.zip",
+      "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+      "size": 391443627
+    }
+  }
+}

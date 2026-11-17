@@ -1,0 +1,74 @@
+# pix-gate 0.4.11 (apply after pix-gate-no-timeout.patch): when the host can't draw pix-gate's terminal
+# overlay (pi-gui throws on ui.custom, RPC returns nothing), ask with pi's standard ui.select instead.
+--- a/packages/pix-gate/src/prompt.ts
++++ b/packages/pix-gate/src/prompt.ts
+@@ -27,6 +27,42 @@
+ 
+ export type GatePromptUI = ExtensionContext["ui"];
+ 
++/**
++ * pi at home: the overlay is drawn with ui.custom(), which only pi's terminal UI has. Hosts that
++ * can't draw it (pi-gui throws, RPC mode returns nothing) get pi's standard select dialog, which
++ * every host shows. Like the overlay, it waits for the user; cancelling counts as "no".
++ */
++async function showDecision(ui: GatePromptUI, config: Parameters<typeof showOverlay>[1]): Promise<OverlayResult> {
++	let drawn = false;
++	const tracked = {
++		custom: ((cb: Parameters<typeof ui.custom>[0], opts?: unknown) =>
++			ui.custom((...args: Parameters<typeof cb>) => {
++				drawn = true;
++				return cb(...args);
++			}, opts as never)) as typeof ui.custom,
++	};
++	try {
++		const result = await showOverlay(tracked as never, config);
++		if (drawn) return result;
++	} catch (error) {
++		if (drawn) throw error;
++	}
++	if (config.signal?.aborted) return { action: "denied" };
++	const choices = config.choices ?? [
++		{ value: "yes", label: "Yes, allow" },
++		{ value: "no", label: "No, block it" },
++	];
++	const title = [config.title, ...(config.body ?? [])].join("\n");
++	const picked = await ui.select(
++		title,
++		choices.map((c) => c.label),
++		{ signal: config.signal } as never,
++	);
++	const choice = choices.find((c) => c.label === picked);
++	const approve = [config.approveValue ?? "yes"].flat();
++	return { action: choice && approve.includes(choice.value) ? "approved" : "denied" };
++}
++
+ /** Title Case a severity tier for dialog titles: "critical" → "Critical". */
+ function titleCase(word: string): string {
+ 	return word ? word[0]!.toUpperCase() + word.slice(1).toLowerCase() : word;
+@@ -111,7 +147,7 @@
+ 					},
+ 				];
+ 
+-	const result: OverlayResult = await showOverlay(ui, {
++	const result: OverlayResult = await showDecision(ui, {
+ 		state,
+ 		signal,
+ 		mode: "confirm",
+@@ -214,7 +250,7 @@
+ 				},
+ 			];
+ 
+-	const result: OverlayResult = await showOverlay(ui, {
++	const result: OverlayResult = await showDecision(ui, {
+ 		state,
+ 		mode: "confirm",
+ 		title,
+@@ -273,7 +309,7 @@
+ 					},
+ 				];
+ 
+-	const result: OverlayResult = await showOverlay(ui, {
++	const result: OverlayResult = await showDecision(ui, {
+ 		state,
+ 		mode: "confirm",
+ 		icon,

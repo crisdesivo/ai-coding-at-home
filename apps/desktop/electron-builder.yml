@@ -1,0 +1,150 @@
+appId: com.cristiandesivo.aicodingathome
+productName: AI Coding at Home
+# Based on pi-gui (MIT, Copyright (c) 2026 Matthew Lam): its notice ships in licenses/.
+copyright: Copyright 2026 Cristian Desivo
+electronVersion: 37.10.3
+
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - out/**/*
+  - package.json
+  # The pnpm collector drops this nested version in the hoisted layout.
+  # Keep retry 0.12 for Pi's lockfile code; other consumers require root 0.13.
+  - from: ../../node_modules/proper-lockfile/node_modules/retry
+    to: node_modules/proper-lockfile/node_modules/retry
+    filter:
+      - "**/*"
+  # The collector nests the newer SSO under Bedrock. Its token provider must
+  # stay below SSO: Bedrock itself pins a different token-provider version.
+  - from: ../../node_modules/@aws-sdk/credential-provider-sso/node_modules/@aws-sdk/token-providers
+    to: node_modules/@aws-sdk/client-bedrock-runtime/node_modules/@aws-sdk/credential-provider-sso/node_modules/@aws-sdk/token-providers
+    filter:
+      - "**/*"
+
+extraResources:
+  - from: resources/icon.png
+    to: icon.png
+  # pi packages that guard every session (scripts/vendor-safeguards.mjs), with their node_modules.
+  - from: resources/safeguards
+    to: safeguards
+    filter:
+      - "**/*"
+  # pi at home's own pi extensions (context-guard).
+  - from: resources/extensions
+    to: extensions
+    filter:
+      - "**/*"
+  # The llama.cpp pin (the engine manager reads it for the first-run CUDA download). The
+  # engine itself is added per platform below, mirroring the dev tree:
+  # <resources>/engine/<linux|win|mac>/llama-server[.exe] + its libraries and LICENSE.
+  - from: resources/engine/engine-pin.json
+    to: engine/engine-pin.json
+  # MIT notices of the projects this app is built from (pi's ships inside its package).
+  - from: ../../LICENSE
+    to: licenses/pi-gui-LICENSE.txt
+
+asar: true
+asarUnpack:
+  - "**/*.node"
+  - "**/*.wasm"
+  - "**/node_modules/node-pty/**/*"
+  - "**/node_modules/.pnpm/node-pty*/node_modules/node-pty/**/*"
+
+artifactName: AI-Coding-at-Home-${version}-${arch}.${ext}
+
+mac:
+  category: public.app-category.developer-tools
+  # No Apple certificate: the zip is built on Linux and the whole .app is ad-hoc signed
+  # afterwards with rcodesign (scripts/package-mac.mjs). Apple chips need that signature.
+  identity: null
+  hardenedRuntime: false
+  notarize: false
+  target:
+    - target: zip
+      arch: arm64
+  darkModeSupport: true
+  # Intel-only native prebuilds: the app is for Apple chips only, and every Mach-O must be arm64.
+  files:
+    - "!**/node_modules/node-pty/prebuilds/darwin-x64{,/**}"
+    - "!**/node_modules/@earendil-works/pi-tui/native/darwin/prebuilds/darwin-x64{,/**}"
+  extraResources:
+    - from: resources/engine/mac
+      to: engine/mac
+      filter:
+        - "**/*"
+
+linux:
+  category: Development
+  executableName: ai-coding-at-home
+  maintainer: Cristian Desivo
+  vendor: Cristian Desivo
+  synopsis: A private AI coding assistant that runs on your own computer
+  description: >-
+    AI Coding at Home is a desktop coding assistant that runs an open AI model on your own
+    computer, with no cloud account and no subscription. It picks a model that fits your
+    hardware and downloads it on first launch.
+  extraResources:
+    - from: resources/engine/linux
+      to: engine/linux
+      filter:
+        - "**/*"
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+
+deb:
+  artifactName: ai-coding-at-home_${version}_${arch}.${ext}
+  packageName: ai-coding-at-home
+  packageCategory: devel
+  priority: optional
+  afterRemove: resources/linux/after-remove.sh
+  depends:
+    - libgtk-3-0 | libgtk-3-0t64
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0 | libatspi2.0-0t64
+    - libuuid1
+    - libsecret-1-0
+    - libgbm1
+    # The bundled llama.cpp engine (Vulkan build; it falls back to the CPU without a GPU).
+    - libvulkan1
+    - libgomp1
+    - libssl3 | libssl3t64
+
+win:
+  executableName: ai-coding-at-home
+  # Keep icon/version metadata editing; unsigned (no certificate).
+  signAndEditExecutable: true
+  target:
+    - target: nsis
+      arch:
+        - x64
+  extraResources:
+    - from: resources/engine/win
+      to: engine/win
+      filter:
+        - "**/*"
+
+nsis:
+  # One-click, per-user install into %LOCALAPPDATA%\Programs: no admin prompt.
+  oneClick: true
+  perMachine: false
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: ${productName}
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false
+  artifactName: AI-Coding-at-Home-${version}-${arch}-setup.${ext}
+
+toolsets:
+  appimage: "1.0.2"

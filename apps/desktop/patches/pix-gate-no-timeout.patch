@@ -1,0 +1,43 @@
+# pix-gate @ pix-mono 98078cb (pix-gate 0.4.11): prompts wait for the user instead of denying after 15/30/60 s.
+# The dialog (pix-pretty gate-overlay) treats timeoutMs 0 as no timer.
+diff --git a/packages/pix-gate/src/prompt.ts b/packages/pix-gate/src/prompt.ts
+index 8dc6946..858a7ee 100644
+--- a/packages/pix-gate/src/prompt.ts
++++ b/packages/pix-gate/src/prompt.ts
+@@ -33,9 +33,9 @@ function titleCase(word: string): string {
+ }
+ 
+ const TIMEOUT_MS: Record<Rule["severity"], number> = {
+-	critical: 15_000,
+-	dangerous: 30_000,
+-	risky: 60_000,
++	critical: 0,
++	dangerous: 0,
++	risky: 0,
+ };
+ 
+ const SEVERITY_COLOR: Record<Rule["severity"], string> = {
+@@ -63,8 +63,8 @@ export const PATH_SEVERITY_ICON: Record<PathRule["severity"], string> = {
+ };
+ 
+ const PATH_TIMEOUT_MS: Record<PathRule["severity"], number> = {
+-	block: 15_000,
+-	warn: 30_000,
++	block: 0,
++	warn: 0,
+ 	info: 0, // info never shows a dialog
+ };
+ 
+@@ -230,9 +230,9 @@ export async function promptMergedGateDecision(
+ }
+ 
+ const TIMEOUT_BY_TIER: Record<string, number> = {
+-	block: 15_000,
+-	dangerous: 30_000,
+-	risky: 60_000,
++	block: 0,
++	dangerous: 0,
++	risky: 0,
+ };
+ 
+ /**
